@@ -134,6 +134,8 @@ static int extract_public_signatures(string& head, string& local_head, string li
         if (trigger) code += c;
         else space += c;
     }
+    code = trim(code);
+    bool isIf = (code.find("if ") == 0);
     if (code.find("typedef") == 0 && code.find(';') != string::npos) {
         head += line + "\n";
         local_head += line + "\n";
@@ -145,7 +147,7 @@ static int extract_public_signatures(string& head, string& local_head, string li
         if (isPublic) {
             head += "DLLIMPORT " + hcode;
             local_head += "DLLEXPORT " + hcode;
-        } else {
+        } else if (!isIf) {
             local_head += "static " + hcode;
         }
         return 0;
@@ -670,7 +672,7 @@ int main(int argc, char** argv) {
         string arg(argv[i]);
         if (!arg.size()) continue;
         if (arg[0] == '-' || arg[0] == '/') {
-            last_flag = argv[i];
+            last_flag = lowercase(argv[i]);
             if (last_flag[0] == '/') {
                 auto co = last_flag.find(':');
                 if (co != string::npos) {
