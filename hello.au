@@ -1,0 +1,23 @@
+/* Copyright © 2020, Mykos Hudson-Crisp <micklionheart@gmail.com>
+* All rights reserved. */
+
+#include <stdio.h>
+
+opaque packed struct Greeter {
+    const char* who;
+}
+
+public void Greeter::SetWho(const char* who) {
+    this->who = who;
+}
+
+const public void Greeter::Greet() {
+    printf("Hello, %s!\n", this->who);
+}
+
+int main(int argc, char** argv) {
+    Greeter greetz;
+    greetz.SetWho("World");
+    greetz.Greet();
+    return 0;
+}
