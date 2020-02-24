@@ -10,18 +10,19 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "prefix_h.h"
-#include "windows_rc.h"
+#include "default_rc.h"
 
 using namespace std;
 
 #define PLAT_WINDOWS 1
 #define PLAT_LINUX 2
+#define PLAT_APPLE 3
 
 struct SourceFile;
 static string prefix((char*)prefix_h, prefix_h_len);
-static string winrc((char*)windows_rc, windows_rc_len);
-static string compiler = "gcc";
-static string linker = "gcc";
+static string winrc((char*)default_rc, default_rc_len);
+static string compiler = "cc";
+static string linker = "cc";
 static string resource_compiler;
 static string cflags = "-fvisibility=hidden -fPIC";
 static string ldflags = "-fvisibility=hidden -fPIC";
@@ -77,6 +78,32 @@ static string str_replace(string text, string find, string replace) {
         text = text.substr(0, pos) + replace + text.substr(pos+find.size());
     }
     return text;
+}
+
+static string chairs(string str, int chairs) {
+    if (str.size() <= chairs) return str;
+    return str.substr(0, chairs);
+}
+
+static string remove_empty_ifdefs(string h) {
+    string last_line, line, out;
+    bool lastWasIf = false;
+    string lastIf;
+    for(auto c: h) {
+        line += c;
+        if (c != '\n') continue;
+        if (chairs(last_line, 3) == "#if" && chairs(line, 6) == "#endif") {
+            line = "";
+            last_line = "";
+            continue;
+        }
+        out += last_line;
+        last_line = line;
+        line = "";
+    }
+    out += last_line;
+    out += line;
+    return out;
 }
 
 static void rewrite_structs(string& code, string& head, string& local_head, string& tail, string space, bool* outputToHeader, int isPacked, int isPublic, int isOpaque) {
@@ -596,20 +623,21 @@ struct SourceFile {
                 else space += c;
             }
             code = trim(code);
+            bool plat = true;
+            if (platform == PLAT_WINDOWS) plat = os == "windows";
+            if (platform == PLAT_LINUX) plat = os == "linux";
+            if (platform == PLAT_APPLE) plat = os == "apple";
+            if (platform == -PLAT_WINDOWS) plat = os != "windows";
+            if (platform == -PLAT_LINUX) plat = os != "linux";
+            if (platform == -PLAT_APPLE) plat = os != "apple";
             if (code.find("#link") == 0) {
                 string lib = trim(code.substr(5));
-                bool ok = true;
-                if (platform == PLAT_WINDOWS) ok = os == "windows";
-                if (platform == PLAT_LINUX) ok = os == "linux";
-                if (ok) libs.push_back(lib);
+                if (plat) libs.push_back(lib);
                 continue;
             }
             if (code.find("#vendor") == 0) {
                 string x = trim(code.substr(7));
-                bool ok = true;
-                if (platform == PLAT_WINDOWS) ok = os == "windows";
-                if (platform == PLAT_LINUX) ok = os == "linux";
-                if (ok) {
+                if (plat) {
                     if (vendor.size()) vendor += ", ";
                     vendor += x;
                 }
@@ -617,42 +645,27 @@ struct SourceFile {
             }
             if (!product.size() && code.find("#product") == 0) {
                 string x = trim(code.substr(8));
-                bool ok = true;
-                if (platform == PLAT_WINDOWS) ok = os == "windows";
-                if (platform == PLAT_LINUX) ok = os == "linux";
-                if (ok) product = x;
+                if (plat) product = x;
                 continue;
             }
             if (!details.size() && code.find("#detail") == 0) {
                 string x = trim(code.substr(7));
-                bool ok = true;
-                if (platform == PLAT_WINDOWS) ok = os == "windows";
-                if (platform == PLAT_LINUX) ok = os == "linux";
-                if (ok) details = x;
+                if (plat) details = x;
                 continue;
             }
             if (!version.size() && code.find("#version") == 0) {
                 string x = trim(code.substr(8));
-                bool ok = true;
-                if (platform == PLAT_WINDOWS) ok = os == "windows";
-                if (platform == PLAT_LINUX) ok = os == "linux";
-                if (ok) version = x;
+                if (plat) version = x;
                 continue;
             }
             if (!icon.size() && code.find("#icon") == 0) {
                 string x = trim(code.substr(5));
-                bool ok = true;
-                if (platform == PLAT_WINDOWS) ok = os == "windows";
-                if (platform == PLAT_LINUX) ok = os == "linux";
-                if (ok) icon = x;
+                if (plat) icon = x;
                 continue;
             }
             if (!manifest.size() && code.find("#manifest") == 0) {
                 string x = trim(code.substr(9));
-                bool ok = true;
-                if (platform == PLAT_WINDOWS) ok = os == "windows";
-                if (platform == PLAT_LINUX) ok = os == "linux";
-                if (ok) manifest = x;
+                if (plat) manifest = x;
                 continue;
             }
             if (code.find("#if") == 0 || code.find("#endif") == 0 || code.find("#else") == 0 || code.find("#elif") == 0) {
@@ -662,13 +675,21 @@ struct SourceFile {
                 } else if (code == "#ifdef OS_LINUX") {
                     platform = PLAT_LINUX;
                     ifdef_depth++;
+                } else if (code == "#ifdef OS_APPLE") {
+                    platform = PLAT_APPLE;
+                    ifdef_depth++;
+                } else if (code == "#ifndef OS_WINDOWS") {
+                    platform = -PLAT_WINDOWS;
+                    ifdef_depth++;
+                } else if (code == "#ifndef OS_LINUX") {
+                    platform = -PLAT_LINUX;
+                    ifdef_depth++;
+                } else if (code == "#ifndef OS_APPLE") {
+                    platform = -PLAT_APPLE;
+                    ifdef_depth++;
                 } else if (code == "#else") {
                     if (ifdef_depth == 1) {
-                        if (platform == PLAT_WINDOWS) {
-                            platform = PLAT_LINUX;
-                        } else if (platform == PLAT_LINUX) {
-                            platform = PLAT_WINDOWS;
-                        }
+                        platform = -platform;
                     }
                 } else {
                     if (code.find("#if") == 0) ifdef_depth++;
@@ -683,6 +704,12 @@ struct SourceFile {
                 body += line + "\n";
                 continue;
             }
+            if (platform == PLAT_WINDOWS && os != "windows") continue;
+            if (platform == PLAT_LINUX && os != "linux") continue;
+            if (platform == PLAT_APPLE && os != "apple") continue;
+            if (platform == -PLAT_WINDOWS && os == "windows") continue;
+            if (platform == -PLAT_LINUX && os == "linux") continue;
+            if (platform == -PLAT_APPLE && os == "apple") continue;
             int isConst = 0;
             if (code.find("const ") == 0) {
                 isConst = 1;
@@ -785,7 +812,35 @@ struct SourceFile {
     }
 };
 
+int usage() {
+    printf("usage: auc <input files>\n");
+    printf("\t/OUT:<output-filename> (-o)\n");
+    printf("\t/DEBUG (-g)\n");
+    printf("\t/DIR:<build-directory> (-d)\n");
+    printf("\t/OS:<operating-system> (-m) [linux, windows, win32]\n");
+    printf("\t/DLL (-shared)\n");
+    printf("\t/QUIET (-q)\n");
+    printf("\t/HELP (-h)\n");
+    printf("\t/PRETTY\n");
+    return 0;
+}
+
+int help() {
+    printf("usage: auc <input files>\n * Supported input types: .au, .c, .dll/.so/.o, .rc, .manifest, .ico\n   (Not implemented: .cpp, .asm, .rs)\n\n");
+    printf("/OUT:<output-filename> (-o)\n\n");
+    printf("/DEBUG (-g)\n\n");
+    printf("/DIR:<build-directory> (-d)\n * Intermediate compile results (generated .o .c and .h files)\n\n");
+    printf("/OS:<operating-system> (-m)\n * Any cross compiler toolchain (eg. 'x86_64-w64-mingw32')\n   or a preset: 'linux', 'windows' (aka 'win64'), 'win32'\n\n");
+    printf("/DLL (-shared)\n * Produce a .dll file instead of an .exe file.\n   (WARNING: Writes a .h file with the same base name as the .dll file)\n\n");
+    printf("/QUIET (-q)\n * Just execute the build commands without printing them first.\n\n");
+    printf("/HELP (-h)\n * Show this help screen.\n\n");
+    printf("/PRETTY\n * Generate pretty .c files from .au sources\n   (Ruins compiler and debugger messages, only meant as an escape hatch.) \n\n");
+    printf("-I, -D, -L, -l\n * Passed through to the compiler or linker.\n\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc <= 1) return usage();
     string last_flag;
     for(int i=1;i<argc;i++) {
         string arg(argv[i]);
@@ -802,17 +857,9 @@ int main(int argc, char** argv) {
                 continue;
             }
         }
-        if (arg[0] == '-' || arg[0] == '/') {
+        if (arg[0] == '-' || (arg[0] == '/' && (file_mtime(arg) < 0))) {
             last_flag = lowercase(argv[i]);
             arg = argl = "";
-            if (last_flag[0] == '/') {
-                auto co = last_flag.find(':');
-                if (co != string::npos) {
-                    arg = last_flag.substr(co+1);
-                    argl = lowercase(arg);
-                    last_flag = last_flag.substr(0, co);
-                }
-            }
             if (last_flag[0] == '-') {
                 auto co = last_flag.find('=');
                 if (co != string::npos) {
@@ -821,43 +868,59 @@ int main(int argc, char** argv) {
                     last_flag = last_flag.substr(0, co);
                 }
             }
-            if (!arg.size()) continue;
+            if (last_flag[0] == '/') {
+                auto co = last_flag.find(':');
+                if (co != string::npos) {
+                    arg = last_flag.substr(co+1);
+                    argl = lowercase(arg);
+                    last_flag = last_flag.substr(0, co);
+                }
+            }
         }
         if (last_flag == "-d" || last_flag == "/dir") {
+            if (!arg.size()) continue;
             build_dir = arg;
             if (!build_dir.size()) build_dir = ".";
             if (build_dir[build_dir.size()-1] != '/') build_dir += "/";
             last_flag = "";
             continue;
-        } else if (last_flag == "/icon") {
-            icon = arg;
-            last_flag = "";
-            continue;
-        } else if (last_flag == "/manifest") {
-            manifest = arg;
-            last_flag = "";
-            continue;
         } else if (last_flag == "-m" || last_flag == "/os") {
+            if (!arg.size()) continue;
             os = argl;
             last_flag = "";
             continue;
         } else if (last_flag == "-o" || last_flag == "/out") {
+            if (!arg.size()) continue;
             output = arg;
             last_flag = "";
             continue;
-        }
-        last_flag = "";
-        if (argl == "-g" || argl == "/debug") {
+        } else if (last_flag == "--compiler" || last_flag == "/cc") {
+            if (!arg.size()) continue;
+            compiler = linker = arg;
+            last_flag = "";
+            continue;
+        } else if (last_flag == "--linker" || last_flag == "/ld") {
+            if (!arg.size()) continue;
+            linker = arg;
+            last_flag = "";
+            continue;
+        } else if (last_flag == "-h" || last_flag == "-?" || last_flag == "--help" || last_flag == "/h" || last_flag == "/?" || last_flag == "/help") {
+            return help();
+        } else if (last_flag == "-g" || last_flag == "/debug") {
             debug_mode = true;
+            last_flag = "";
             continue;
-        } else if (argl == "-shared" || argl == "/dll") {
+        } else if (last_flag == "-shared" || last_flag == "/dll") {
             dll_mode = true;
+            last_flag = "";
             continue;
-        } else if (argl == "-q" || argl == "/quiet") {
+        } else if (last_flag == "-q" || last_flag == "/quiet") {
             quiet = true;
+            last_flag = "";
             continue;
-        } else if (argl == "--no-line-directives" || argl == "/noline") {
+        } else if (last_flag == "/pretty") {
             line_directives = false;
+            last_flag = "";
             continue;
         }
         if (!output.size()) {
@@ -866,7 +929,9 @@ int main(int argc, char** argv) {
         string ext = extract_ext(argv[i]);
         if (ext == "c") c_files.push_back(argv[i]);
         if (ext == "rc") rc_files.push_back(argv[i]);
-        if (ext == "so" || ext == "dll") dll_files.push_back(argv[i]);
+        if (ext == "ico") icon = argv[i];
+        if (ext == "manifest") manifest = argv[i];
+        if (ext == "so" || ext == "dll" || ext == "o") dll_files.push_back(argv[i]);
         if (ext == "cpp") cpp_files.push_back(argv[i]);
         if (ext == "asm") asm_files.push_back(argv[i]);
         if (ext == "rs") rs_files.push_back(argv[i]);
@@ -882,32 +947,52 @@ int main(int argc, char** argv) {
     }
     if (os == "windows" || os == "win32" || os == "win64") {
         if (dll_mode) {
-            if (output.substr(output.size()-4) != ".dll") {
+            if (output.size()<=4 || output.substr(output.size()-4) != ".dll") {
                 output += ".dll";
             }
         } else {
-            if (output.substr(output.size()-4) != ".exe") {
+            if (output.size()<=4 || output.substr(output.size()-4) != ".exe") {
                 output += ".exe";
             }
         }
         if (os == "win32") {
-            os = "i686-w64-mingw32";
+            os = "i686";
         } else {
-            os = "x86_64-w64-mingw32";
+            os = "x86_64";
         }
-        compiler = os + "-" + compiler;
-        linker = os + "-" + linker;
-        resource_compiler = os + "-windres";
+        compiler = os + "-w64-mingw32-gcc";
+        linker = os + "-w64-mingw32-gcc";
+        resource_compiler = os + "-w64-mingw32-windres";
         ldflags += " -Wl,--subsystem,windows -mwindows";
         os = "windows";
     } else if (os == "linux") {
-        if (dll_mode && output.substr(output.size()-3) != ".so") {
-            output += ".so";
+        if (dll_mode) {
+            if (output.size()<=3 || output.substr(output.size()-3) != ".so") {
+                output += ".so";
+            }
+            ldflags += " -Wl,-soname,'"+extract_filename(output)+"'";
+        } else {
+            if (output.size()<=4 || output.substr(output.size()-4) != ".elf") {
+                output += ".elf";
+            }
         }
-        ldflags += " -Wl,-soname,'"+extract_filename(output)+"'";
     } else {
-        compiler = os + "-" + compiler;
-        linker = os + "-" + linker;
+        string test = os + "-cc --help 2>/dev/null >/dev/null";
+        if (!system(test.c_str())) {
+            compiler = os + "-cc";
+            linker = os + "-cc";
+        } else {
+            compiler = os + "-gcc";
+            linker = os + "-gcc";
+        }
+    }
+    if (compiler == "cc" && system("cc --help 2>/dev/null >/dev/null")) {
+        if (!system("gcc --help 2>/dev/null >/dev/null")) compiler = linker = "gcc";
+        else if (!system("clang --help 2>/dev/null >/dev/null")) compiler = linker = "clang";
+        else {
+            fprintf(stderr, "Failed to find a C compiler, please specify one with /CC:<c-compiler>\n");
+            return 1;
+        }
     }
     string head, body;
     map<string, string> template_renders;
@@ -929,7 +1014,7 @@ int main(int argc, char** argv) {
         if (!ok) break;
     }
     mkdir(build_dir.c_str(), 0777);
-    string bdir = build_dir + os;
+    string bdir = build_dir + os + (debug_mode ? "-debug" : "-release");
     mkdir(bdir.c_str(), 0777);
     bdir += "/";
     string include_list;
@@ -1044,7 +1129,8 @@ int main(int argc, char** argv) {
     if (dll_mode) {
         string file_token = strip_filename(output) + "_dll";
         string out_fn = strip_file_ext(output) + ".h";
-        export_h = "#ifndef "+file_token+"\n" + "#define "+file_token+"\n" + prefix + export_h + "#endif\n";
+        export_h = "#ifndef "+file_token+"\n" + "#define "+file_token+"\n" + export_h + "#endif\n";
+        export_h = remove_empty_ifdefs(export_h);
         if (!write_file(out_fn, export_h)) {
             fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
             return 1;
