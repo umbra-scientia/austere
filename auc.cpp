@@ -23,7 +23,7 @@ string ldflags = "-fvisibility=hidden -fPIC";
 string release_flags = "-fomit-frame-pointer -ffast-math -flto=8 -fgraphite-identity -ftree-loop-distribution -floop-nest-optimize -march=amdfam10 -mtune=znver1 -Ofast -s";
 string debug_flags = "-fstrict-aliasing -ffast-math -flto=8 -g";
 
-#ifdef WIN32
+#ifdef _WIN32
 #define stat _stat
 #endif
 
