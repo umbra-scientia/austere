@@ -9,7 +9,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "prefix_h.h"
+#include "austere_h.h"
 #include "default_rc.h"
 
 using namespace std;
@@ -19,7 +19,7 @@ using namespace std;
 #define PLAT_APPLE 3
 
 struct SourceFile;
-static string prefix((char*)prefix_h, prefix_h_len);
+static string prefix((char*)austere_h, austere_h_len);
 static string winrc((char*)default_rc, default_rc_len);
 static string compiler = "cc";
 static string linker = "cc";
@@ -30,7 +30,7 @@ static string release_flags = "-fomit-frame-pointer -ffast-math -flto=8 -fgraphi
 static string debug_flags = "-fstrict-aliasing -ffast-math -flto=8 -g";
 static string icon, manifest, details, vendor, product, version="0,0,0,0", copyright;
 static vector<string> libs;
-static bool line_directives = true;
+static bool human = false;
 static vector<SourceFile*> files;
 static vector<string> c_files, rc_files, dll_files, cpp_files, asm_files, rs_files, cs_files;
 static string build_dir = "build/";
@@ -106,7 +106,7 @@ static string remove_empty_ifdefs(string h) {
     return out;
 }
 
-static void rewrite_structs(string& code, string& head, string& local_head, string& tail, string space, bool* outputToHeader, int isPacked, int isPublic, int isOpaque) {
+static void rewrite_structs(string& code, string& head, string& public_head, string& local_head, string& tail, string space, int* outputToHeader, int isPacked, int isPublic, int isOpaque, int isPrivate) {
     int isStruct = (code.find("struct") == 0);
     int isClass = (code.find("class") == 0);
     if (!isStruct && !isClass) return;
@@ -124,19 +124,23 @@ static void rewrite_structs(string& code, string& head, string& local_head, stri
     while (code.size() && isspace(code[0])) {
         code = code.substr(1);
     }
-    if (isOpaque) {
+    if (isPrivate) {
         local_head += "typedef struct " + tname + " " + tname + ";\n";
-        head += "typedef struct " + tname + " " + tname + ";\n";
         code = "struct " + tname + " " + code;
         tail = space + "};";
+    } else if (isOpaque) {
+        *outputToHeader = 2;
+        public_head += "typedef struct " + tname + " " + tname + ";\n";
+        code = "typedef struct " + tname + " {";
+        tail = space + "} " + tname + ";";
     } else if (isPublic) {
-        *outputToHeader = true;
+        *outputToHeader = 1;
         code = "typedef struct " + tname + " {";
         tail = space + "} " + tname + ";";
     } else {
-        local_head += "typedef struct " + tname + " " + tname + ";\n";
-        code = "struct " + tname + " {";
-        tail = space + "};";
+        *outputToHeader = 2;
+        code = "typedef struct " + tname + " {";
+        tail = space + "} " + tname + ";";
     }
     if (isPacked) {
         code = "#pragma pack(push, 1)\n" + space + code;
@@ -144,7 +148,7 @@ static void rewrite_structs(string& code, string& head, string& local_head, stri
     }
 }
 
-static void rewrite_enums(string& code, string& head, string& local_head, string& tail, string space, bool* outputToHeader, int isPublic, int isOpaque) {
+static void rewrite_enums(string& code, string& head, string& public_head, string& local_head, string& tail, string space, int* outputToHeader, int isPublic, int isOpaque, int isPrivate) {
     int isEnum = (code.find("enum") == 0);
     if (!isEnum) return;
     if (code.find('{') == string::npos) return;
@@ -161,11 +165,17 @@ static void rewrite_enums(string& code, string& head, string& local_head, string
     while (code.size() && isspace(code[0])) {
         code = code.substr(1);
     }
-    if (isOpaque) {
+    if (isPrivate) {
         head += "typedef int " + tname + ";\n";
         local_head += "typedef int " + tname + ";\n";
+    } else if (isOpaque) {
+        head += "typedef int " + tname + ";\n";
+        public_head += "typedef int " + tname + ";\n";
+        *outputToHeader = 3;
     } else if (isPublic) {
-        *outputToHeader = true;
+        *outputToHeader = 1;
+    } else {
+        *outputToHeader = 2;
     }
     code = "typedef enum {";
     tail = space + "} " + tname + ";";
@@ -539,12 +549,12 @@ static string rewrite_member_calls(string& code, map<string, string>& var_type_t
 struct SourceFile {
     string filename;
     string head, body, tail;
-    string local_head, post_head, local_post_head;
+    string local_head, post_head, local_post_head, public_head;
     string template_class;
     vector<string> template_vars;
     vector<string> lines;
     map<string, string> var_type_table;
-    bool outputToHeader;
+    int outputToHeader;
     bool valid;
     bool processed;
     SourceFile(const char* filename_) {
@@ -554,7 +564,7 @@ struct SourceFile {
         FILE*fp = fopen(filename_, "r");
         if (!fp) return;
         int line_no = 0;
-        if (line_directives) body = "#line 1 \""+filename+"\"\n";
+        if (!human) body = "#line 1 \""+filename+"\"\n";
         while (!feof(fp)) {
             string line = "";
             while (!feof(fp)) {
@@ -605,10 +615,11 @@ struct SourceFile {
         valid = true;
     }
     bool Compile(map<string, string> template_params = map<string, string>()) {
-        outputToHeader = false;
+        outputToHeader = 0;
         int line_no = 0;
         int ifdef_depth = 0;
         int platform = 0;
+        int build_mode = 0;
         for(string line: lines) {
             line_no++;
             for(auto i: template_params) {
@@ -630,6 +641,8 @@ struct SourceFile {
             if (platform == -PLAT_WINDOWS) plat = os != "windows";
             if (platform == -PLAT_LINUX) plat = os != "linux";
             if (platform == -PLAT_APPLE) plat = os != "apple";
+            if (build_mode == 1 && dll_mode != 0) plat = false;
+            if (build_mode == 2 && dll_mode != 1) plat = false;
             if (code.find("#link") == 0) {
                 string lib = trim(code.substr(5));
                 if (plat) libs.push_back(lib);
@@ -643,33 +656,71 @@ struct SourceFile {
                 }
                 continue;
             }
-            if (!product.size() && code.find("#product") == 0) {
+            if (code.find("#product") == 0) {
                 string x = trim(code.substr(8));
-                if (plat) product = x;
+                if (!product.size() && plat) product = x;
                 continue;
             }
-            if (!details.size() && code.find("#detail") == 0) {
+            if (code.find("#detail") == 0) {
                 string x = trim(code.substr(7));
-                if (plat) details = x;
+                if (!details.size() && plat) details = x;
                 continue;
             }
-            if (!version.size() && code.find("#version") == 0) {
+            if (code.find("#version") == 0) {
                 string x = trim(code.substr(8));
-                if (plat) version = x;
+                if (!version.size() && plat) version = x;
                 continue;
             }
-            if (!icon.size() && code.find("#icon") == 0) {
+            if (code.find("#icon") == 0) {
                 string x = trim(code.substr(5));
-                if (plat) icon = x;
+                if (!icon.size() && plat) icon = x;
                 continue;
             }
-            if (!manifest.size() && code.find("#manifest") == 0) {
+            if (code.find("#manifest") == 0) {
                 string x = trim(code.substr(9));
-                if (plat) manifest = x;
+                if (!manifest.size() && plat) manifest = x;
+                continue;
+            }
+            if (code.find("#public_") == 0) {
+                if (plat) {
+                    string z = space + "#" + line.substr(line.find("#public_") + 8);
+                    public_head += z + "\n";
+                    local_head += z + "\n";
+                    head += z + "\n";
+                    body += z + "\n";
+                }
+                continue;
+            }
+            if (code.find("#global_") == 0) {
+                if (plat) {
+                    string z = space + "#" + line.substr(line.find("#global_") + 8);
+                    local_head += z + "\n";
+                    head += z + "\n";
+                    body += z + "\n";
+                }
+                continue;
+            }
+            if (code.find("#define") == 0 || code.find("#include") == 0) {
+                if (plat) {
+                    head += line + "\n";
+                    body += line + "\n";
+                }
                 continue;
             }
             if (code.find("#if") == 0 || code.find("#endif") == 0 || code.find("#else") == 0 || code.find("#elif") == 0) {
-                if (code == "#ifdef OS_WINDOWS") {
+                if (code == "#ifdef BUILD_EXE") {
+                    build_mode = 1;
+                    ifdef_depth++;
+                } else if (code == "#ifdef BUILD_DLL") {
+                    build_mode = 2;
+                    ifdef_depth++;
+                } else if (code == "#ifndef BUILD_EXE") {
+                    build_mode = 2;
+                    ifdef_depth++;
+                } else if (code == "#ifndef BUILD_DLL") {
+                    build_mode = 1;
+                    ifdef_depth++;
+                } else if (code == "#ifdef OS_WINDOWS") {
                     platform = PLAT_WINDOWS;
                     ifdef_depth++;
                 } else if (code == "#ifdef OS_LINUX") {
@@ -690,16 +741,21 @@ struct SourceFile {
                 } else if (code == "#else") {
                     if (ifdef_depth == 1) {
                         platform = -platform;
+                        if (build_mode) {
+                            build_mode = 3 - build_mode;
+                        }
                     }
                 } else {
                     if (code.find("#if") == 0) ifdef_depth++;
                     if (code.find("#endif") == 0) {
                         if (ifdef_depth <= 1) {
                             platform = 0;
+                            build_mode = 0;
                         }
                         ifdef_depth--;
                     }
                 }
+                local_head += line + "\n";
                 head += line + "\n";
                 body += line + "\n";
                 continue;
@@ -730,6 +786,14 @@ struct SourceFile {
             if (code.find("opaque ") == 0) {
                 isOpaque = 1;
                 code = code.substr(6);
+                while (code.size() && isspace(code[0])) {
+                    code = code.substr(1);
+                }
+            }
+            int isPrivate = 0;
+            if (code.find("private ") == 0) {
+                isPrivate = 1;
+                code = code.substr(7);
                 while (code.size() && isspace(code[0])) {
                     code = code.substr(1);
                 }
@@ -775,8 +839,8 @@ struct SourceFile {
                 fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());
                 return false;
             }
-            rewrite_structs(code, head, local_head, tail, space, &outputToHeader, isPacked, isPublic, isOpaque);
-            rewrite_enums(code, head, local_head, tail, space, &outputToHeader, isPublic, isOpaque);
+            rewrite_structs(code, head, public_head, local_head, tail, space, &outputToHeader, isPacked, isPublic, isOpaque, isPrivate);
+            rewrite_enums(code, head, public_head, local_head, tail, space, &outputToHeader, isPublic, isOpaque, isPrivate);
             err = rewrite_member_calls(code, var_type_table);
             if (err.size()) {
                 fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());
@@ -791,14 +855,20 @@ struct SourceFile {
             if (tail.size() && (code == "}" || code == "};")) {
                 code = tail;
                 tail = "";
-                outputToHeader = false;
+                outputToHeader = 0;
             }
             code = space + code + "\n";
-            if (oth) {
+            if (oth == 1) {
+                head += code;
+                public_head += code;
+                local_head += code;
+            } else if (oth == 2) {
                 head += code;
                 local_head += code;
+            } else if (oth == 3) {
+                local_head += code;
             } else {
-                if (line_directives) {
+                if (!human) {
                     char buf[512];
                     memset(buf, 0, sizeof(buf));
                     snprintf(buf, sizeof(buf)-1, "#line %d \"%s\"\n", line_no, filename.c_str());
@@ -919,7 +989,7 @@ int main(int argc, char** argv) {
             last_flag = "";
             continue;
         } else if (last_flag == "/pretty") {
-            line_directives = false;
+            human = true;
             last_flag = "";
             continue;
         }
@@ -1022,8 +1092,9 @@ int main(int argc, char** argv) {
     for(auto f: files) {
         if (f->template_class.size()) continue;
         string file_id = str_replace(str_replace(f->filename, ".", "_"), "/", "_");
-        export_h += f->head + f->post_head;
+        export_h += f->public_head + f->post_head;
         f->head = "#ifndef "+file_id+"\n" + "#define "+file_id+"\n" + prefix + f->head + f->post_head + "#endif\n";
+        f->head = remove_empty_ifdefs(f->head);
         string out_hname = strip_filename(f->filename);
         string out_fn = bdir + out_hname + ".au.h";
         include_list += "#include \""+out_hname+".au.h\"\n";
@@ -1041,6 +1112,9 @@ int main(int argc, char** argv) {
     }
     if (dll_mode) {
         ldflags += " -shared";
+        cflags += " -DBUILD_DLL";
+    } else {
+        cflags += " -DBUILD_EXE";
     }
 
     string obj_list;

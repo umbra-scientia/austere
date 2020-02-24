@@ -1,5 +1,5 @@
-#ifndef __AUSTERE_TYPES__
-#define __AUSTERE_TYPES__
+#ifndef __AUSTERE_H__
+#define __AUSTERE_H__
 #include <stdlib.h>
 typedef unsigned long long	u64;
 typedef unsigned int		u32;
@@ -17,25 +17,29 @@ const static bool           false = 0;
 const static bool           true = 1;
 #endif
 #ifndef DLLEXPORT
-#ifdef _MSC_VER
-#define DLLEXPORT __declspec(dllexport)
-#else
-#define DLLEXPORT __attribute__((visibility("default")))
-#endif
+    #ifdef _MSC_VER
+        #define DLLEXPORT __declspec(dllexport)
+    #else
+        #define DLLEXPORT __attribute__((visibility("default")))
+    #endif
 #endif
 #ifndef DLLIMPORT
-#ifdef _MSC_VER
-#define DLLIMPORT __declspec(dllimport)
-#else
-#define DLLIMPORT
-#endif
+    #ifdef _MSC_VER
+        #define DLLIMPORT __declspec(dllimport)
+    #else
+        #define DLLIMPORT
+    #endif
 #endif
 #ifdef _WIN32
-#ifndef OS_WINDOWS
-#define OS_WINDOWS
-#endif
+    #ifndef OS_WINDOWS
+    #define OS_WINDOWS
+    #endif
+#elif defined(__APPLE__)
+    #ifndef OS_APPLE
+    #define OS_APPLE
+    #endif
 #else
-#ifndef OS_LINUX
-#define OS_LINUX
-#endif
+    #ifndef OS_LINUX
+    #define OS_LINUX
+    #endif
 #endif
