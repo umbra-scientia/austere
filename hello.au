@@ -4,6 +4,15 @@ opaque packed struct Greeter {
     const char* who;
 }
 
+public Greeter* Greeter::ctor(const char* who_) {
+    this->who = who_;
+    return this;
+}
+
+public void Greeter::dtor() {
+    printf("Goodbye, %s.\n", this->who);
+}
+
 public void Greeter::SetWho(const char* who) {
     this->who = who;
 }
@@ -13,8 +22,10 @@ const public void Greeter::Greet() {
 }
 
 int main(int argc, char** argv) {
-    Greeter greetz;
-    greetz.SetWho("World");
-    greetz.Greet();
+    Greeter* greetz = new Greeter("Tester");
+    greetz->Greet();
+    greetz->SetWho("World");
+    greetz->Greet();
+    delete greetz;
     return 0;
 }

@@ -16,12 +16,14 @@ using namespace std;
 #define PLAT_LINUX 2
 
 #include "prefix_h.h"
+string prefix((char*)prefix_h, prefix_h_len);
 string compiler = "gcc";
 string linker = "gcc";
 string cflags = "-fvisibility=hidden -fPIC";
 string ldflags = "-fvisibility=hidden -fPIC";
 string release_flags = "-fomit-frame-pointer -ffast-math -flto=8 -fgraphite-identity -ftree-loop-distribution -floop-nest-optimize -march=amdfam10 -mtune=znver1 -Ofast -s";
 string debug_flags = "-fstrict-aliasing -ffast-math -flto=8 -g";
+bool line_directives = true;
 
 #ifdef _WIN32
 #define stat _stat
@@ -178,7 +180,7 @@ static string read_symbol(string line, int pos) {
     return o;
 }
 
-static string resolve_member_functions(string line, int isHead, int isStatic, int isConst) {
+static string resolve_member_functions(string line, int isHead, int isStatic, int isConst, int isCustom, map<string, string>& var_type_table) {
     auto col = line.find("::");
     if (col == string::npos) return line;
     auto sp = line.rfind(' ', col);
@@ -194,7 +196,10 @@ static string resolve_member_functions(string line, int isHead, int isStatic, in
             break;
         }
     }
-    string out = line.substr(0, sp+1) + type + "_" + line.substr(col+2, par-col-2) + "(";
+    string func = line.substr(col+2, par-col-2);
+    string realfunc = type + "_" + func;
+    if (isCustom) var_type_table[realfunc] = "custom";
+    string out = line.substr(0, sp+1) + realfunc + "(";
     if (!isStatic) {
         if (isConst) {
             out += "const ";
@@ -205,7 +210,16 @@ static string resolve_member_functions(string line, int isHead, int isStatic, in
         }
         if (hasArgs) out += ", ";
     }
-    out += line.substr(par+1);
+    line = line.substr(par+1);
+    auto curly = line.find('{');
+    bool isCtor = !isCustom && !isHead && (func == "ctor");
+    if (isCtor && curly != string::npos) {
+        out += line.substr(0, curly+1);
+        out += "if (!this) this = malloc(sizeof("+type+")); ";
+        out += line.substr(curly+1);
+    } else {
+        out += line;
+    }
     return out;
 }
 
@@ -260,41 +274,110 @@ static string trim_type(string type) {
     return type;
 }
 
-static void extract_variable_types(string code, map<string, string>& var_type_table) {
-    string buffer;
-    code = trim(code);
-    bool valid = true;
+static string rewrite_delete(string& code, string type, string name, map<string, string>& var_type_table) {
+    type = var_type_table[name];
+
+    if (!type.size()) {
+        return "Unknown type for "+name;
+    }
+    bool isPtr = false;
+    if (type[type.size()-1] == '*') {
+        isPtr = true;
+        type = type.substr(0, type.size()-1);
+    }
+    string newcode = type + "_dtor";
+    bool isCustom = (var_type_table[newcode] == "custom");
+    newcode += "(";
+    if (!isPtr) {
+        newcode += "&";
+    }
+    newcode += name + ");";
+    if (isPtr && !isCustom) {
+        newcode += " free(" + name + ");";
+    }
+    code = str_replace(code, "delete "+name, newcode);
+    return "";
+}
+
+static string rewrite_new(string& code, string type, string name, string obuffer, map<string, string>& var_type_table) {
+    type = name;
+    bool isPtr = false;
+    if (type[type.size()-1] == '*') {
+        isPtr = true;
+        type = type.substr(0, type.size()-1);
+    }
+    string newcode = type+"_ctor(0";
+    auto hack = code.find(obuffer) + obuffer.size();
+    while (isspace(code[hack])) hack++;
+    if (code[hack] != ')') {
+        newcode += ", ";
+    }
+    code = str_replace(code, obuffer, newcode);
+    return "";
+}
+
+static string extract_variable_types(string& code, map<string, string>& var_type_table) {
     bool hasCurly = (code.find('{') != string::npos);
-    bool skip_whitespace = true;
-    for(auto c: code) {
-        if (skip_whitespace && isspace(c)) continue;
-        skip_whitespace = false;
-        if (c == ';' || c == '=' || c == ',' || c == ')') {
-            buffer = trim(buffer);
-            if (valid && valid_type_def(buffer)) {
-                auto pos = buffer.rfind(' ');
-                string type = buffer.substr(0, pos);
-                string name = buffer.substr(pos + 1);
-                if (type != "return") {
-                    type = trim_type(type);
-                    var_type_table[name] = type;
+    bool done = false;
+    while (!done) {
+        string buffer;
+        bool valid = true;
+        bool skip_whitespace = true;
+        code = trim(code);
+        done = true;
+        for(auto c: code) {
+            if (skip_whitespace && isspace(c)) continue;
+            skip_whitespace = false;
+            if (c == ';' || c == '=' || c == ',' || c == ')') {
+                buffer = trim(buffer);
+                if (valid && valid_type_def(buffer)) {
+                    auto pos = buffer.rfind(' ');
+                    string type = buffer.substr(0, pos);
+                    string name = buffer.substr(pos + 1);
+                    if (type == "delete") {
+                        // weird place to handle this but it naturally gets caught here anyways...
+                        string err = rewrite_delete(code, type, name, var_type_table);
+                        if (err.size()) return err;
+                        done = false;
+                        break;
+                    } else if (type != "return") {
+                        type = trim_type(type);
+                        var_type_table[name] = type;
+                    }
+                    buffer = "";
+                    continue;
+                } else {
+                    valid = false;
                 }
+                buffer = "";
+            }
+            if (c == ';' || c == ',' || c == '(') {
+                string obuffer = buffer + c;
+                buffer = trim(buffer);
+                if (valid_type_def(buffer)) {
+                    auto pos = buffer.rfind(' ');
+                    string type = buffer.substr(0, pos);
+                    string name = buffer.substr(pos + 1);
+                    if (type == "new") {
+                        string err = rewrite_new(code, type, name, obuffer, var_type_table);
+                        if (err.size()) return err;
+                        done = false;
+                        break;
+                    }
+                }
+                skip_whitespace = true;
+                buffer = "";
+                valid = true;
+                continue;
+            }
+            if (isspace(c)) {
+                buffer = trim(buffer) + c;
             } else {
-                valid = false;
+                buffer += c;
             }
         }
-        if (c == ';' || c == ',' || c == '(') {
-            skip_whitespace = true;
-            buffer = "";
-            valid = true;
-            continue;
-        }
-        if (isspace(c)) {
-            buffer = trim(buffer) + c;
-        } else {
-            buffer += c;
-        }
     }
+    return "";
 }
 
 static string rewrite_member_calls(string& code, map<string, string>& var_type_table) {
@@ -346,15 +429,15 @@ static string rewrite_member_calls(string& code, map<string, string>& var_type_t
             break;
         }
         auto t = var_type_table[obj];
-        if (!t.size()) return "[%s:%d] Unknown type for "+obj+"\n";
+        if (!t.size()) return "Unknown type for "+obj;
         while (isspace(code[r+1])) r++;
         bool isPtr = false;
         if (t[t.size()-1] == '*') {
             isPtr = true;
             t = t.substr(0, t.size()-1);
         }
-        if (isPtr && type != "->") return "[%s:%d] Variable \""+obj+"\" is a pointer, use -> for member calls.\n";
-        if (!isPtr && type != ".") return "[%s:%d] Variable \""+obj+"\" is not a pointer, use . for member calls.\n";
+        if (isPtr && type != "->") return "Variable \""+obj+"\" is a pointer, use -> for member calls.";
+        if (!isPtr && type != ".") return "Variable \""+obj+"\" is not a pointer, use . for member calls.";
         string newcode = code.substr(0, l+1) + t + "_" + func + "(";
         if (isPtr) {
             newcode += obj;
@@ -386,7 +469,7 @@ struct SourceFile {
         FILE*fp = fopen(filename_, "r");
         if (!fp) return;
         int line_no = 0;
-        body = "#line 1 \""+filename+"\"\n";
+        if (line_directives) body = "#line 1 \""+filename+"\"\n";
         while (!feof(fp)) {
             string line = "";
             while (!feof(fp)) {
@@ -477,6 +560,14 @@ struct SourceFile {
                     code = code.substr(1);
                 }
             }
+            int isCustom = 0;
+            if (code.find("custom ") == 0) {
+                isCustom = 1;
+                code = code.substr(6);
+                while (code.size() && isspace(code[0])) {
+                    code = code.substr(1);
+                }
+            }
             int isOpaque = 0;
             if (code.find("opaque ") == 0) {
                 isOpaque = 1;
@@ -520,19 +611,23 @@ struct SourceFile {
                 }
             }
             if (isPublic) {
-                string hcode = resolve_member_functions(code, 1, isStatic, isConst);
+                string hcode = resolve_member_functions(code, 1, isStatic, isConst, isCustom, var_type_table);
                 extract_public_signatures(head, local_head, hcode, isPacked, isPublic);
             }
-            extract_variable_types(code, var_type_table);
+            string err = extract_variable_types(code, var_type_table);
+            if (err.size()) {
+                fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());
+                return false;
+            }
             rewrite_structs(code, head, local_head, tail, space, &outputToHeader, isPacked, isPublic, isOpaque);
             rewrite_enums(code, head, local_head, tail, space, &outputToHeader, isPublic, isOpaque);
-            string err = rewrite_member_calls(code, var_type_table);
+            err = rewrite_member_calls(code, var_type_table);
             if (err.size()) {
-                fprintf(stderr, err.c_str(), filename.c_str(), line_no);
+                fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());
                 return false;
             }
             if (isMember) {
-                code = resolve_member_functions(code, 0, isStatic, isConst);
+                code = resolve_member_functions(code, 0, isStatic, isConst, isCustom, var_type_table);
             }
             if (isStatic && !isMember) code = "static " + code;
             if (isConst && !isMember) code = "const " + code;
@@ -547,11 +642,12 @@ struct SourceFile {
                 head += code;
                 local_head += code;
             } else {
-                char buf[512];
-                memset(buf, 0, sizeof(buf));
-                snprintf(buf, sizeof(buf)-1, "#line %d \"%s\"\n", line_no, filename.c_str());
-                body += buf;
-
+                if (line_directives) {
+                    char buf[512];
+                    memset(buf, 0, sizeof(buf));
+                    snprintf(buf, sizeof(buf)-1, "#line %d \"%s\"\n", line_no, filename.c_str());
+                    body += buf;
+                }
                 body += code;
                 code = "";
             }
@@ -571,6 +667,7 @@ int main(int argc, char** argv) {
 #endif
     bool debug_mode = false;
     bool dll_mode = false;
+    bool quiet = false;
     string last_flag;
     for(int i=1;i<argc;i++) {
         string arg(argv[i]);
@@ -611,6 +708,12 @@ int main(int argc, char** argv) {
             continue;
         } else if (arg == "-shared" || arg == "/dll") {
             dll_mode = true;
+            continue;
+        } else if (arg == "-q" || arg == "/quiet") {
+            quiet = true;
+            continue;
+        } else if (arg == "--no-line-directives" || arg == "/noline") {
+            line_directives = false;
             continue;
         }
         if (!output.size()) {
@@ -675,7 +778,7 @@ int main(int argc, char** argv) {
         if (f->template_class.size()) continue;
         string file_id = str_replace(str_replace(f->filename, ".", "_"), "/", "_");
         export_h += f->head;
-        f->head = "#ifndef "+file_id+"\n" + "#define "+file_id+"\n" + string(prefix_h) + f->head + "#endif\n";
+        f->head = "#ifndef "+file_id+"\n" + "#define "+file_id+"\n" + prefix + f->head + "#endif\n";
         string out_hname = strip_filename(f->filename);
         string out_fn = build_dir + out_hname + ".au.h";
         include_list += "#include \""+out_hname+".au.h\"\n";
@@ -700,7 +803,7 @@ int main(int argc, char** argv) {
     for(auto f: files) {
         if (f->template_class.size()) continue;
         string file_id = str_replace(str_replace(f->filename, ".", "_"), "/", "_");
-        f->body = string(prefix_h) + "#define "+file_id+"\n" + include_list + f->local_head + f->body;
+        f->body = prefix + "#define "+file_id+"\n" + include_list + f->local_head + f->body;
         string out_base = build_dir + strip_filename(f->filename);
         string out_fn = out_base + ".au.c";
         if (!write_file(out_fn, f->body)) {
@@ -712,20 +815,22 @@ int main(int argc, char** argv) {
         if (obj_list.size()) obj_list += " ";
         obj_list += out_ob;
         if (should_rebuild(out_ob, file_mtime(out_fn))) {
-            printf("%s\n", cmd.c_str());
-            system(cmd.c_str());
+            if (!quiet) printf("%s\n", cmd.c_str());
+            int r = system(cmd.c_str());
+            if (r) return r;
             relink = true;
         }
     }
     if (relink || file_mtime(output) < 0) {
         string cmd = linker + " -o " + output + " " + obj_list + " " + ldflags;
-        printf("%s\n", cmd.c_str());
-        system(cmd.c_str());
+        if (!quiet) printf("%s\n", cmd.c_str());
+        int r = system(cmd.c_str());
+        if (r) return r;
     }
     if (dll_mode) {
         string file_token = strip_filename(output) + "_dll";
         string out_fn = strip_file_ext(output) + ".h";
-        export_h = "#ifndef "+file_token+"\n" + "#define "+file_token+"\n" + string(prefix_h) + export_h + "#endif\n";
+        export_h = "#ifndef "+file_token+"\n" + "#define "+file_token+"\n" + prefix + export_h + "#endif\n";
         if (!write_file(out_fn, export_h)) {
             fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
             return 1;

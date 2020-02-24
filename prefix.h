@@ -1,5 +1,6 @@
 #ifndef __AUSTERE_TYPES__
 #define __AUSTERE_TYPES__
+#include <stdlib.h>
 typedef unsigned long long	u64;
 typedef unsigned int		u32;
 typedef unsigned short		u16;
