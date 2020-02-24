@@ -146,8 +146,7 @@ static int extract_public_signatures(string& head, string& local_head, string li
             head += "DLLIMPORT " + hcode;
             local_head += "DLLEXPORT " + hcode;
         } else {
-            head += hcode;
-            local_head += hcode;
+            local_head += "static " + hcode;
         }
         return 0;
     }
@@ -610,10 +609,8 @@ struct SourceFile {
                     fprintf(stderr, "[%s:%d] Unable to extract symbol.\n", filename.c_str(), line_no);
                 }
             }
-            if (isPublic) {
-                string hcode = resolve_member_functions(code, 1, isStatic, isConst, isCustom, var_type_table);
-                extract_public_signatures(head, local_head, hcode, isPacked, isPublic);
-            }
+            string hcode = resolve_member_functions(code, 1, isStatic, isConst, isCustom, var_type_table);
+            extract_public_signatures(head, local_head, hcode, isPacked, isPublic);
             string err = extract_variable_types(code, var_type_table);
             if (err.size()) {
                 fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());

@@ -10,7 +10,8 @@ public Greeter* Greeter::ctor(const char* who_) {
 }
 
 public void Greeter::dtor() {
-    printf("Goodbye, %s.\n", this->who);
+    printf("Goodbye, %s.", this->who);
+    end_line();
 }
 
 public void Greeter::SetWho(const char* who) {
@@ -18,14 +19,10 @@ public void Greeter::SetWho(const char* who) {
 }
 
 const public void Greeter::Greet() {
-    printf("Hello, %s!\n", this->who);
+    printf("Hello, %s!", this->who);
+    end_line();
 }
 
-int main(int argc, char** argv) {
-    Greeter* greetz = new Greeter("Tester");
-    greetz->Greet();
-    greetz->SetWho("World");
-    greetz->Greet();
-    delete greetz;
-    return 0;
+void end_line() {
+    printf("\n");
 }
