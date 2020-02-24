@@ -9,21 +9,39 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "prefix_h.h"
+#include "windows_rc.h"
 
 using namespace std;
 
 #define PLAT_WINDOWS 1
 #define PLAT_LINUX 2
 
-#include "prefix_h.h"
-string prefix((char*)prefix_h, prefix_h_len);
-string compiler = "gcc";
-string linker = "gcc";
-string cflags = "-fvisibility=hidden -fPIC";
-string ldflags = "-fvisibility=hidden -fPIC";
-string release_flags = "-fomit-frame-pointer -ffast-math -flto=8 -fgraphite-identity -ftree-loop-distribution -floop-nest-optimize -march=amdfam10 -mtune=znver1 -Ofast -s";
-string debug_flags = "-fstrict-aliasing -ffast-math -flto=8 -g";
-bool line_directives = true;
+struct SourceFile;
+static string prefix((char*)prefix_h, prefix_h_len);
+static string winrc((char*)windows_rc, windows_rc_len);
+static string compiler = "gcc";
+static string linker = "gcc";
+static string resource_compiler;
+static string cflags = "-fvisibility=hidden -fPIC";
+static string ldflags = "-fvisibility=hidden -fPIC";
+static string release_flags = "-fomit-frame-pointer -ffast-math -flto=8 -fgraphite-identity -ftree-loop-distribution -floop-nest-optimize -march=amdfam10 -mtune=znver1 -Ofast -s";
+static string debug_flags = "-fstrict-aliasing -ffast-math -flto=8 -g";
+static string icon, manifest, details, vendor, product, version="0,0,0,0", copyright;
+static vector<string> libs;
+static bool line_directives = true;
+static vector<SourceFile*> files;
+static vector<string> c_files, rc_files, dll_files, cpp_files, asm_files, rs_files, cs_files;
+static string build_dir = "build/";
+static string output = "";
+#ifdef _WIN32
+static string os = "windows";
+#else
+static string os = "linux";
+#endif
+static bool debug_mode = false;
+static bool dll_mode = false;
+static bool quiet = false;
 
 #ifdef _WIN32
 #define stat _stat
@@ -126,7 +144,7 @@ static void rewrite_enums(string& code, string& head, string& local_head, string
     tail = space + "} " + tname + ";";
 }
 
-static int extract_public_signatures(string& head, string& local_head, string line, int isPacked, int isPublic) {
+static int extract_public_signatures(string& head, string& post_head, string& local_post_head, string& local_head, string& line, int isPacked, int isPublic) {
     string space, code;
     int trigger = 0;
     for(auto c: line) {
@@ -135,7 +153,12 @@ static int extract_public_signatures(string& head, string& local_head, string li
         else space += c;
     }
     code = trim(code);
-    bool isIf = (code.find("if ") == 0);
+    bool isNotFunction = false;
+    if (code.find("if ") == 0) isNotFunction = true;
+    if (code.find("else ") == 0) isNotFunction = true;
+    if (code.find("switch ") == 0) isNotFunction = true;
+    if (code.find("for ") == 0) isNotFunction = true;
+    if (code.find("while ") == 0) isNotFunction = true;
     if (code.find("typedef") == 0 && code.find(';') != string::npos) {
         head += line + "\n";
         local_head += line + "\n";
@@ -145,9 +168,10 @@ static int extract_public_signatures(string& head, string& local_head, string li
     if (end != string::npos && code.find('{') != string::npos) {
         string hcode = code.substr(0, end+1) + ";\n";
         if (isPublic) {
-            head += "DLLIMPORT " + hcode;
-            local_head += "DLLEXPORT " + hcode;
-        } else if (!isIf) {
+            post_head += "DLLIMPORT " + hcode;
+            local_post_head += "DLLEXPORT " + hcode;
+            line = space + "DLLEXPORT " + code;
+        } else if (!isNotFunction) {
             local_head += "static " + hcode;
         }
         return 0;
@@ -230,6 +254,39 @@ static bool write_file(string filename, string data) {
     fwrite(data.data(), 1, data.size(), fp);
     fclose(fp);
     return true;
+}
+
+static string read_file(string filename) {
+    string out;
+    FILE* fp = fopen(filename.c_str(), "rb");
+    if (!fp) return out;
+    while (!feof(fp)) {
+        int c = fgetc(fp);
+        if (c == EOF) break;
+        out += (char)c;
+    }
+    fclose(fp);
+    return out;
+}
+
+static string extract_ext(string fn) {
+    auto x = fn.rfind('.');
+    if (x == string::npos) return "";
+    return fn.substr(x+1);
+}
+
+static string extract_dir(string fn) {
+    auto x = fn.rfind('/');
+    if (x == string::npos) x = fn.rfind('\\');
+    if (x == string::npos) return ".";
+    return fn.substr(0, x);
+}
+
+static string extract_filename(string fn) {
+    auto x = fn.rfind('/');
+    if (x == string::npos) x = fn.rfind('\\');
+    if (x == string::npos) return fn;
+    return fn.substr(x+1);
 }
 
 static string strip_filename(string fn) {
@@ -455,7 +512,7 @@ static string rewrite_member_calls(string& code, map<string, string>& var_type_t
 struct SourceFile {
     string filename;
     string head, body, tail;
-    string local_head;
+    string local_head, post_head, local_post_head;
     string template_class;
     vector<string> template_vars;
     vector<string> lines;
@@ -481,7 +538,21 @@ struct SourceFile {
                 line += (char)c;
             }
             line_no++;
-            if (trim(line).find("#template") == 0) {
+            string l = trim(line);
+            if (l.find("#copyright") == 0) {
+                string cline = trim(l.substr(10));
+                lines.push_back("// Copyright (C) "+cline+"\n");
+                auto clip = cline.find('<');
+                if (clip != string::npos) {
+                    cline = trim(cline.substr(0, clip));
+                }
+                if (copyright.size()) {
+                    copyright += ", ";
+                }
+                copyright += cline;
+                continue;
+            }
+            if (l.find("#template") == 0) {
                 lines.push_back("");
                 line = trim(line.substr(9));
                 auto lt = line.find('<');
@@ -525,6 +596,65 @@ struct SourceFile {
                 else space += c;
             }
             code = trim(code);
+            if (code.find("#link") == 0) {
+                string lib = trim(code.substr(5));
+                bool ok = true;
+                if (platform == PLAT_WINDOWS) ok = os == "windows";
+                if (platform == PLAT_LINUX) ok = os == "linux";
+                if (ok) libs.push_back(lib);
+                continue;
+            }
+            if (code.find("#vendor") == 0) {
+                string x = trim(code.substr(7));
+                bool ok = true;
+                if (platform == PLAT_WINDOWS) ok = os == "windows";
+                if (platform == PLAT_LINUX) ok = os == "linux";
+                if (ok) {
+                    if (vendor.size()) vendor += ", ";
+                    vendor += x;
+                }
+                continue;
+            }
+            if (!product.size() && code.find("#product") == 0) {
+                string x = trim(code.substr(8));
+                bool ok = true;
+                if (platform == PLAT_WINDOWS) ok = os == "windows";
+                if (platform == PLAT_LINUX) ok = os == "linux";
+                if (ok) product = x;
+                continue;
+            }
+            if (!details.size() && code.find("#detail") == 0) {
+                string x = trim(code.substr(7));
+                bool ok = true;
+                if (platform == PLAT_WINDOWS) ok = os == "windows";
+                if (platform == PLAT_LINUX) ok = os == "linux";
+                if (ok) details = x;
+                continue;
+            }
+            if (!version.size() && code.find("#version") == 0) {
+                string x = trim(code.substr(8));
+                bool ok = true;
+                if (platform == PLAT_WINDOWS) ok = os == "windows";
+                if (platform == PLAT_LINUX) ok = os == "linux";
+                if (ok) version = x;
+                continue;
+            }
+            if (!icon.size() && code.find("#icon") == 0) {
+                string x = trim(code.substr(5));
+                bool ok = true;
+                if (platform == PLAT_WINDOWS) ok = os == "windows";
+                if (platform == PLAT_LINUX) ok = os == "linux";
+                if (ok) icon = x;
+                continue;
+            }
+            if (!manifest.size() && code.find("#manifest") == 0) {
+                string x = trim(code.substr(9));
+                bool ok = true;
+                if (platform == PLAT_WINDOWS) ok = os == "windows";
+                if (platform == PLAT_LINUX) ok = os == "linux";
+                if (ok) manifest = x;
+                continue;
+            }
             if (code.find("#if") == 0 || code.find("#endif") == 0 || code.find("#else") == 0 || code.find("#elif") == 0) {
                 if (code == "#ifdef OS_WINDOWS") {
                     platform = PLAT_WINDOWS;
@@ -612,7 +742,7 @@ struct SourceFile {
                 }
             }
             string hcode = resolve_member_functions(code, 1, isStatic, isConst, isCustom, var_type_table);
-            extract_public_signatures(head, local_head, hcode, isPacked, isPublic);
+            extract_public_signatures(head, post_head, local_post_head, local_head, hcode, isPacked, isPublic);
             string err = extract_variable_types(code, var_type_table);
             if (err.size()) {
                 fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());
@@ -656,27 +786,30 @@ struct SourceFile {
 };
 
 int main(int argc, char** argv) {
-    vector<SourceFile*> files;
-    string build_dir = "build/";
-    string output = "";
-#ifdef _WIN32
-    string os = "windows";
-#else
-    string os = "linux";
-#endif
-    bool debug_mode = false;
-    bool dll_mode = false;
-    bool quiet = false;
     string last_flag;
     for(int i=1;i<argc;i++) {
         string arg(argv[i]);
         if (!arg.size()) continue;
+        string argl = lowercase(arg);
+        if (arg.size() >= 2) {
+            string z = arg.substr(0, 2);
+            if (z == "-D" || z == "-I") {
+                cflags += " "+arg;
+                continue;
+            }
+            if (z == "-L" || z == "-l") {
+                ldflags += " "+arg;
+                continue;
+            }
+        }
         if (arg[0] == '-' || arg[0] == '/') {
             last_flag = lowercase(argv[i]);
+            arg = argl = "";
             if (last_flag[0] == '/') {
                 auto co = last_flag.find(':');
                 if (co != string::npos) {
                     arg = last_flag.substr(co+1);
+                    argl = lowercase(arg);
                     last_flag = last_flag.substr(0, co);
                 }
             }
@@ -684,16 +817,28 @@ int main(int argc, char** argv) {
                 auto co = last_flag.find('=');
                 if (co != string::npos) {
                     arg = last_flag.substr(co+1);
+                    argl = lowercase(arg);
                     last_flag = last_flag.substr(0, co);
                 }
             }
+            if (!arg.size()) continue;
         }
-        if (last_flag == "-b" || last_flag == "--build-dir") {
+        if (last_flag == "-d" || last_flag == "/dir") {
             build_dir = arg;
+            if (!build_dir.size()) build_dir = ".";
+            if (build_dir[build_dir.size()-1] != '/') build_dir += "/";
+            last_flag = "";
+            continue;
+        } else if (last_flag == "/icon") {
+            icon = arg;
+            last_flag = "";
+            continue;
+        } else if (last_flag == "/manifest") {
+            manifest = arg;
             last_flag = "";
             continue;
         } else if (last_flag == "-m" || last_flag == "/os") {
-            os = lowercase(arg);
+            os = argl;
             last_flag = "";
             continue;
         } else if (last_flag == "-o" || last_flag == "/out") {
@@ -702,28 +847,38 @@ int main(int argc, char** argv) {
             continue;
         }
         last_flag = "";
-        if (arg == "-g" || arg == "/debug") {
+        if (argl == "-g" || argl == "/debug") {
             debug_mode = true;
             continue;
-        } else if (arg == "-shared" || arg == "/dll") {
+        } else if (argl == "-shared" || argl == "/dll") {
             dll_mode = true;
             continue;
-        } else if (arg == "-q" || arg == "/quiet") {
+        } else if (argl == "-q" || argl == "/quiet") {
             quiet = true;
             continue;
-        } else if (arg == "--no-line-directives" || arg == "/noline") {
+        } else if (argl == "--no-line-directives" || argl == "/noline") {
             line_directives = false;
             continue;
         }
         if (!output.size()) {
             output = strip_filename(argv[i]);
         }
-        auto f = new SourceFile(argv[i]);
-        if (!f->valid) {
-            fprintf(stderr, "[%s] Parse failed.\n", argv[i]);
-            return 1;
+        string ext = extract_ext(argv[i]);
+        if (ext == "c") c_files.push_back(argv[i]);
+        if (ext == "rc") rc_files.push_back(argv[i]);
+        if (ext == "so" || ext == "dll") dll_files.push_back(argv[i]);
+        if (ext == "cpp") cpp_files.push_back(argv[i]);
+        if (ext == "asm") asm_files.push_back(argv[i]);
+        if (ext == "rs") rs_files.push_back(argv[i]);
+        if (ext == "cs") cs_files.push_back(argv[i]);
+        if (ext == "au") {
+            auto f = new SourceFile(argv[i]);
+            if (!f->valid) {
+                fprintf(stderr, "[%s] Parse failed.\n", argv[i]);
+                return 1;
+            }
+            files.push_back(f);
         }
-        files.push_back(f);
     }
     if (os == "windows" || os == "win32" || os == "win64") {
         if (dll_mode) {
@@ -736,18 +891,20 @@ int main(int argc, char** argv) {
             }
         }
         if (os == "win32") {
-            compiler = "i686-w64-mingw32-" + compiler;
-            linker = "i686-w64-mingw32-" + linker;
+            os = "i686-w64-mingw32";
         } else {
-            compiler = "x86_64-w64-mingw32-" + compiler;
-            linker = "x86_64-w64-mingw32-" + linker;
+            os = "x86_64-w64-mingw32";
         }
+        compiler = os + "-" + compiler;
+        linker = os + "-" + linker;
+        resource_compiler = os + "-windres";
         ldflags += " -Wl,--subsystem,windows -mwindows";
+        os = "windows";
     } else if (os == "linux") {
         if (dll_mode && output.substr(output.size()-3) != ".so") {
             output += ".so";
         }
-        ldflags += " -Wl,-soname,"+output;
+        ldflags += " -Wl,-soname,'"+extract_filename(output)+"'";
     } else {
         compiler = os + "-" + compiler;
         linker = os + "-" + linker;
@@ -771,15 +928,19 @@ int main(int argc, char** argv) {
         }
         if (!ok) break;
     }
+    mkdir(build_dir.c_str(), 0777);
+    string bdir = build_dir + os;
+    mkdir(bdir.c_str(), 0777);
+    bdir += "/";
     string include_list;
     string export_h;
     for(auto f: files) {
         if (f->template_class.size()) continue;
         string file_id = str_replace(str_replace(f->filename, ".", "_"), "/", "_");
-        export_h += f->head;
-        f->head = "#ifndef "+file_id+"\n" + "#define "+file_id+"\n" + prefix + f->head + "#endif\n";
+        export_h += f->head + f->post_head;
+        f->head = "#ifndef "+file_id+"\n" + "#define "+file_id+"\n" + prefix + f->head + f->post_head + "#endif\n";
         string out_hname = strip_filename(f->filename);
-        string out_fn = build_dir + out_hname + ".au.h";
+        string out_fn = bdir + out_hname + ".au.h";
         include_list += "#include \""+out_hname+".au.h\"\n";
         if (!write_file(out_fn, f->head)) {
             fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
@@ -799,29 +960,83 @@ int main(int argc, char** argv) {
 
     string obj_list;
     bool relink = false;
+    if (dll_files.size()) {
+        ldflags += " -Wl,-rpath,.";
+    }
+    for(auto f: dll_files) {
+        cflags += " -I'"+extract_dir(f)+"'";
+        ldflags += " -Wl,-rpath,'"+extract_dir(f)+"'";
+        obj_list += " "+f;
+    }
     for(auto f: files) {
         if (f->template_class.size()) continue;
         string file_id = str_replace(str_replace(f->filename, ".", "_"), "/", "_");
-        f->body = prefix + "#define "+file_id+"\n" + include_list + f->local_head + f->body;
-        string out_base = build_dir + strip_filename(f->filename);
+        f->body = prefix + "#define "+file_id+"\n" + include_list + f->local_head + f->local_post_head + f->body;
+        string out_base = bdir + strip_filename(f->filename);
         string out_fn = out_base + ".au.c";
         if (!write_file(out_fn, f->body)) {
             fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
             return 1;
         }
         string out_ob = out_base + ".au.o";
-        string cmd = compiler + " -c -o " + out_ob + " " + out_fn + " " + cflags;
-        if (obj_list.size()) obj_list += " ";
-        obj_list += out_ob;
-        if (should_rebuild(out_ob, file_mtime(out_fn))) {
+        string srcdir = extract_dir(f->filename);
+        string cmd = compiler + " -c -o '"+out_ob+"' '"+out_fn+"' -I'" + srcdir + "' " + cflags;
+        obj_list += " '"+out_ob+"'";
+        if (should_rebuild(out_ob, file_mtime(f->filename))) {
             if (!quiet) printf("%s\n", cmd.c_str());
             int r = system(cmd.c_str());
             if (r) return r;
             relink = true;
         }
     }
+    for(auto f: c_files) {
+        string file_id = str_replace(str_replace(f, ".", "_"), "/", "_");
+        string out_ob = bdir + strip_filename(f) + ".c.o";
+        string cmd = compiler + " -c -o '"+out_ob+"' '"+f+"' " + cflags;
+        obj_list += " '"+out_ob+"'";
+        if (should_rebuild(out_ob, file_mtime(f))) {
+            if (!quiet) printf("%s\n", cmd.c_str());
+            int r = system(cmd.c_str());
+            if (r) return r;
+            relink = true;
+        }
+    }
+    if (resource_compiler.size()) {
+        if (!rc_files.size()) {
+            string rc = winrc;
+            rc = str_replace(rc, "$ICON", icon.size() ? ("APPICON ICON "+icon) : "");
+            rc = str_replace(rc, "$MANIFEST", manifest.size() ? ("1 24 "+manifest) : "");
+            rc = str_replace(rc, "$DETAILS", details);
+            rc = str_replace(rc, "$VENDOR", vendor);
+            rc = str_replace(rc, "$PRODUCT", product);
+            rc = str_replace(rc, "$VERSION", version);
+            rc = str_replace(rc, "$COPYRIGHT", copyright);
+            rc = str_replace(rc, "$SONAME", extract_filename(output));
+            string out_fn = bdir + "default.rc";
+            if (read_file(out_fn) != rc) {
+                if (!write_file(out_fn, rc)) {
+                    fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
+                    return 1;
+                }
+            }
+            rc_files.push_back(out_fn);
+        }
+        for(auto f: rc_files) {
+            string file_id = str_replace(str_replace(f, ".", "_"), "/", "_");
+            string out_ob = bdir + strip_filename(f) + ".rc.o";
+            string cmd = resource_compiler + " -o '"+out_ob+"' '"+f+"'";
+            obj_list += " '"+out_ob+"'";
+            if (should_rebuild(out_ob, file_mtime(f))) {
+                if (!quiet) printf("%s\n", cmd.c_str());
+                int r = system(cmd.c_str());
+                if (r) return r;
+                relink = true;
+            }
+        }
+    }
     if (relink || file_mtime(output) < 0) {
-        string cmd = linker + " -o " + output + " " + obj_list + " " + ldflags;
+        string cmd = linker + " -o '"+output+"' "+obj_list+" "+ldflags;
+        for(auto l: libs) cmd += " -l"+l;
         if (!quiet) printf("%s\n", cmd.c_str());
         int r = system(cmd.c_str());
         if (r) return r;
