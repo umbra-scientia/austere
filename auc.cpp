@@ -14,6 +14,11 @@
 
 using namespace std;
 
+#define WARNING_STYLE "\x1B[1m\x1B[33m"
+#define ERROR_STYLE "\x1B[1m\x1B[31m"
+#define HILITE "\x1B[1m"
+#define REGGS "\x1B[0m"
+
 #define PLAT_WINDOWS 1
 #define PLAT_LINUX 2
 #define PLAT_APPLE 3
@@ -28,7 +33,7 @@ static string cflags = "-fvisibility=hidden -fPIC";
 static string ldflags = "-fvisibility=hidden -fPIC";
 static string release_flags = "-fomit-frame-pointer -ffast-math -flto=8 -fgraphite-identity -ftree-loop-distribution -floop-nest-optimize -march=amdfam10 -mtune=znver1 -Ofast -s";
 static string debug_flags = "-fstrict-aliasing -ffast-math -flto=8 -g";
-static string icon, manifest, details, vendor, product, version="0,0,0,0", copyright;
+static string icon, manifest, details, vendor, product, version, copyright;
 static vector<string> libs;
 static bool human = false;
 static vector<SourceFile*> files;
@@ -42,7 +47,7 @@ static string os = "linux";
 #endif
 static bool debug_mode = false;
 static bool dll_mode = false;
-static bool quiet = false;
+static bool quiet = true;
 
 #ifdef _WIN32
 #define stat _stat
@@ -57,6 +62,24 @@ static long file_mtime(string filename) {
 static bool should_rebuild(string dst, long src_mtime) {
     if (file_mtime(dst) < src_mtime) return true;
     return false;
+}
+
+static string line_directive(string in, bool human, int line_no, string filename) {
+    if (human) return in;
+    string out;
+    bool doit = true;
+    for(auto c: in) {
+        if (doit) {
+            char buf[512];
+            memset(buf, 0, sizeof(buf));
+            snprintf(buf, sizeof(buf)-1, "#line %d \"%s\"\n", line_no, filename.c_str());
+            out += buf;
+            doit = false;
+        }
+        out += c;
+        if (c == '\n') doit = true;
+    }
+    return out;
 }
 
 static string trim(string line) {
@@ -92,6 +115,22 @@ static string remove_empty_ifdefs(string h) {
     for(auto c: h) {
         line += c;
         if (c != '\n') continue;
+        if (last_line == "#pragma pack(pop)\n" && line == "#pragma pack(push, 1)\n") {
+            line = "";
+            last_line = "";
+            continue;
+        }
+        if (chairs(last_line, 3) == "#if" && chairs(line, 5) == "#else") {
+            if (chairs(last_line, 6) == "#ifdef") {
+                last_line = "#ifndef" + last_line.substr(6);
+            } else if (chairs(last_line, 7) == "#ifndef") {
+                last_line = "#ifdef" + last_line.substr(7);
+            } else {
+                last_line = "#if !(" + last_line.substr(3, last_line.size()-4)+")\n";
+            }
+            line = "";
+            continue;
+        }
         if (chairs(last_line, 3) == "#if" && chairs(line, 6) == "#endif") {
             line = "";
             last_line = "";
@@ -106,7 +145,7 @@ static string remove_empty_ifdefs(string h) {
     return out;
 }
 
-static void rewrite_structs(string& code, string& head, string& public_head, string& local_head, string& tail, string space, int* outputToHeader, int isPacked, int isPublic, int isOpaque, int isPrivate) {
+static void rewrite_structs(string& code, string& head, string& public_head, string& local_head, string& tail, string space, int* outputToHeader, int isPacked, int isPublic, int isOpaque, int isPrivate, map<string,int>& symbol_flags) {
     int isStruct = (code.find("struct") == 0);
     int isClass = (code.find("class") == 0);
     if (!isStruct && !isClass) return;
@@ -124,13 +163,17 @@ static void rewrite_structs(string& code, string& head, string& public_head, str
     while (code.size() && isspace(code[0])) {
         code = code.substr(1);
     }
+    symbol_flags[tname] |= 2;
     if (isPrivate) {
         local_head += "typedef struct " + tname + " " + tname + ";\n";
         code = "struct " + tname + " " + code;
         tail = space + "};";
     } else if (isOpaque) {
-        *outputToHeader = 2;
-        public_head += "typedef struct " + tname + " " + tname + ";\n";
+        *outputToHeader = 3;
+        head += "typedef struct " + tname + " " + tname + ";\n";
+        if (isPublic) {
+            public_head += "typedef struct " + tname + " " + tname + ";\n";
+        }
         code = "typedef struct " + tname + " {";
         tail = space + "} " + tname + ";";
     } else if (isPublic) {
@@ -166,7 +209,7 @@ static void rewrite_enums(string& code, string& head, string& public_head, strin
         code = code.substr(1);
     }
     if (isPrivate) {
-        head += "typedef int " + tname + ";\n";
+        //head += "typedef int " + tname + ";\n";
         local_head += "typedef int " + tname + ";\n";
     } else if (isOpaque) {
         head += "typedef int " + tname + ";\n";
@@ -181,7 +224,7 @@ static void rewrite_enums(string& code, string& head, string& public_head, strin
     tail = space + "} " + tname + ";";
 }
 
-static int extract_public_signatures(string& head, string& post_head, string& local_post_head, string& local_head, string& line, int isPacked, int isPublic) {
+static int extract_public_signatures(string& head, string& post_head, string& public_post_head, string& local_post_head, string& local_head, string& line, int isPacked, int isPublic, int isPrivate) {
     string space, code;
     int trigger = 0;
     for(auto c: line) {
@@ -198,18 +241,21 @@ static int extract_public_signatures(string& head, string& post_head, string& lo
     if (code.find("while ") == 0) isNotFunction = true;
     if (code.find("typedef") == 0 && code.find(';') != string::npos) {
         head += line + "\n";
-        local_head += line + "\n";
+        //local_head += line + "\n";
         return 1;
     }
     auto end = code.rfind(')');
     if (end != string::npos && code.find('{') != string::npos) {
         string hcode = code.substr(0, end+1) + ";\n";
         if (isPublic) {
-            post_head += "DLLIMPORT " + hcode;
+            post_head += hcode;
+            public_post_head += "DLLIMPORT " + hcode;
             local_post_head += "DLLEXPORT " + hcode;
             line = space + "DLLEXPORT " + code;
-        } else if (!isNotFunction) {
+        } else if (isPrivate) {
             local_head += "static " + hcode;
+        } else if (!isNotFunction) {
+            head += hcode;
         }
         return 0;
     }
@@ -273,12 +319,11 @@ static string resolve_member_functions(string line, int isHead, int isStatic, in
         if (hasArgs) out += ", ";
     }
     line = line.substr(par+1);
-    auto curly = line.find('{');
+    auto curly = line.find('\n');
     bool isCtor = !isCustom && !isHead && (func == "ctor");
     if (isCtor && curly != string::npos) {
-        out += line.substr(0, curly+1);
-        out += "if (!this) this = malloc(sizeof("+type+")); ";
-        out += line.substr(curly+1);
+        out += line;
+        out += "if (!this) this = malloc(sizeof("+type+"));\n";
     } else {
         out += line;
     }
@@ -411,7 +456,7 @@ static string rewrite_new(string& code, string type, string name, string obuffer
     return "";
 }
 
-static string extract_variable_types(string& code, map<string, string>& var_type_table) {
+static string extract_variable_types(string& code, map<string, string>& var_type_table, map<string,int>& symbol_flags, bool hasTail) {
     bool hasCurly = (code.find('{') != string::npos);
     bool done = false;
     while (!done) {
@@ -438,6 +483,10 @@ static string extract_variable_types(string& code, map<string, string>& var_type
                     } else if (type != "return") {
                         type = trim_type(type);
                         var_type_table[name] = type;
+                        symbol_flags[type] |= 4 + 8;
+                        if (hasTail) {
+                            symbol_flags[type] |= 1;
+                        }
                     }
                     buffer = "";
                     continue;
@@ -453,6 +502,7 @@ static string extract_variable_types(string& code, map<string, string>& var_type
                     auto pos = buffer.rfind(' ');
                     string type = buffer.substr(0, pos);
                     string name = buffer.substr(pos + 1);
+                    symbol_flags[type] |= 8;
                     if (type == "new") {
                         string err = rewrite_new(code, type, name, obuffer, var_type_table);
                         if (err.size()) return err;
@@ -524,15 +574,15 @@ static string rewrite_member_calls(string& code, map<string, string>& var_type_t
             break;
         }
         auto t = var_type_table[obj];
-        if (!t.size()) return "Unknown type for "+obj;
+        if (!t.size()) return "'" HILITE + obj + REGGS "' has unknown type";
         while (isspace(code[r+1])) r++;
         bool isPtr = false;
         if (t[t.size()-1] == '*') {
             isPtr = true;
             t = t.substr(0, t.size()-1);
         }
-        if (isPtr && type != "->") return "Variable \""+obj+"\" is a pointer, use -> for member calls.";
-        if (!isPtr && type != ".") return "Variable \""+obj+"\" is not a pointer, use . for member calls.";
+        if (isPtr && type != "->") return "'" HILITE + obj + REGGS "' is a pointer, use -> for member calls";
+        if (!isPtr && type != ".") return "'" HILITE + obj + REGGS "' is not a pointer, use . for member calls";
         string newcode = code.substr(0, l+1) + t + "_" + func + "(";
         if (isPtr) {
             newcode += obj;
@@ -549,7 +599,7 @@ static string rewrite_member_calls(string& code, map<string, string>& var_type_t
 struct SourceFile {
     string filename;
     string head, body, tail;
-    string local_head, post_head, local_post_head, public_head;
+    string local_head, post_head, public_post_head, local_post_head, public_head;
     string template_class;
     vector<string> template_vars;
     vector<string> lines;
@@ -557,10 +607,16 @@ struct SourceFile {
     int outputToHeader;
     bool valid;
     bool processed;
+    int rearrangements;
+    bool rebuild;
+    map<string,int> symbol_flags;
+    vector<SourceFile*> exports_to, imports_from;
     SourceFile(const char* filename_) {
         valid = false;
         processed = false;
         filename = filename_;
+        rearrangements = 0;
+        rebuild = false;
         FILE*fp = fopen(filename_, "r");
         if (!fp) return;
         int line_no = 0;
@@ -595,7 +651,7 @@ struct SourceFile {
                 auto lt = line.find('<');
                 auto gt = line.find('>');
                 if (lt == string::npos || gt == string::npos) {
-                    fprintf(stderr, "[%s:%d] Invalid #template directive.\n", filename, line_no);
+                    fprintf(stderr, HILITE "%s:%d: " WARNING_STYLE "warning:" REGGS " invalid #template directive\n", filename.c_str(), line_no);
                     continue;
                 }
                 template_class = trim(line.substr(0, lt));
@@ -685,25 +741,26 @@ struct SourceFile {
                 if (plat) {
                     string z = space + "#" + line.substr(line.find("#public_") + 8);
                     public_head += z + "\n";
-                    local_head += z + "\n";
+                    //local_head += z + "\n";
                     head += z + "\n";
-                    body += z + "\n";
+                    body += line_directive(z+"\n", human, line_no, filename);
+                    //body += z + "\n";
                 }
                 continue;
             }
             if (code.find("#global_") == 0) {
                 if (plat) {
                     string z = space + "#" + line.substr(line.find("#global_") + 8);
-                    local_head += z + "\n";
+                    //local_head += z + "\n";
                     head += z + "\n";
-                    body += z + "\n";
+                    body += line_directive(z+"\n", human, line_no, filename);
                 }
                 continue;
             }
             if (code.find("#define") == 0 || code.find("#include") == 0) {
                 if (plat) {
-                    head += line + "\n";
-                    body += line + "\n";
+                    local_head += line + "\n";
+                    //body += line_directive(line+"\n", human, line_no, filename);
                 }
                 continue;
             }
@@ -755,9 +812,10 @@ struct SourceFile {
                         ifdef_depth--;
                     }
                 }
-                local_head += line + "\n";
+                //local_head += line + "\n";
                 head += line + "\n";
-                body += line + "\n";
+                body += line_directive(line+"\n", human, line_no, filename);
+                //body += line + "\n";
                 continue;
             }
             if (platform == PLAT_WINDOWS && os != "windows") continue;
@@ -828,22 +886,23 @@ struct SourceFile {
                 string obj = read_symbol_backwards(code, memberHint-1);
                 if (obj.size()) {
                     var_type_table["this"] = obj+"*";
+                    symbol_flags[obj] |= 4 + 8;
                 } else {
-                    fprintf(stderr, "[%s:%d] Unable to extract symbol.\n", filename.c_str(), line_no);
+                    fprintf(stderr, HILITE "%s:%d: " WARNING_STYLE "warning:" REGGS " failed to deduce type for 'this'\n", filename.c_str(), line_no);
                 }
             }
             string hcode = resolve_member_functions(code, 1, isStatic, isConst, isCustom, var_type_table);
-            extract_public_signatures(head, post_head, local_post_head, local_head, hcode, isPacked, isPublic);
-            string err = extract_variable_types(code, var_type_table);
+            extract_public_signatures(head, post_head, public_post_head, local_post_head, local_head, hcode, isPacked, isPublic, isPrivate);
+            string err = extract_variable_types(code, var_type_table, symbol_flags, tail.size());
             if (err.size()) {
-                fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());
+                fprintf(stderr, HILITE "%s:%d: " ERROR_STYLE "error:" REGGS " %s\n", filename.c_str(), line_no, err.c_str());
                 return false;
             }
-            rewrite_structs(code, head, public_head, local_head, tail, space, &outputToHeader, isPacked, isPublic, isOpaque, isPrivate);
+            rewrite_structs(code, head, public_head, local_head, tail, space, &outputToHeader, isPacked, isPublic, isOpaque, isPrivate, symbol_flags);
             rewrite_enums(code, head, public_head, local_head, tail, space, &outputToHeader, isPublic, isOpaque, isPrivate);
             err = rewrite_member_calls(code, var_type_table);
             if (err.size()) {
-                fprintf(stderr, "[%s:%d] %s\n", filename.c_str(), line_no, err.c_str());
+                fprintf(stderr, HILITE "%s:%d: " ERROR_STYLE "error:" REGGS " %s\n", filename.c_str(), line_no, err.c_str());
                 return false;
             }
             if (isMember) {
@@ -861,26 +920,30 @@ struct SourceFile {
             if (oth == 1) {
                 head += code;
                 public_head += code;
-                local_head += code;
+                //local_head += code;
             } else if (oth == 2) {
                 head += code;
-                local_head += code;
+                //local_head += code;
             } else if (oth == 3) {
                 local_head += code;
             } else {
-                if (!human) {
-                    char buf[512];
-                    memset(buf, 0, sizeof(buf));
-                    snprintf(buf, sizeof(buf)-1, "#line %d \"%s\"\n", line_no, filename.c_str());
-                    body += buf;
-                }
-                body += code;
+                body += line_directive(code, human, line_no, filename);
+                //body += code;
                 code = "";
             }
         }
         return true;
     }
 };
+
+void set_rebuild_recursive(SourceFile* f) {
+    if (f->rebuild) return;
+    f->rebuild = true;
+    for(auto d: f->exports_to) {
+        set_rebuild_recursive(d);
+    }
+}
+
 
 int usage() {
     printf("usage: auc <input files>\n");
@@ -889,7 +952,7 @@ int usage() {
     printf("\t/DIR:<build-directory> (-d)\n");
     printf("\t/OS:<operating-system> (-m) [linux, windows, win32]\n");
     printf("\t/DLL (-shared)\n");
-    printf("\t/QUIET (-q)\n");
+    printf("\t/VERBOSE (-v)\n");
     printf("\t/HELP (-h)\n");
     printf("\t/PRETTY\n");
     return 0;
@@ -902,7 +965,7 @@ int help() {
     printf("/DIR:<build-directory> (-d)\n * Intermediate compile results (generated .o .c and .h files)\n\n");
     printf("/OS:<operating-system> (-m)\n * Any cross compiler toolchain (eg. 'x86_64-w64-mingw32')\n   or a preset: 'linux', 'windows' (aka 'win64'), 'win32'\n\n");
     printf("/DLL (-shared)\n * Produce a .dll file instead of an .exe file.\n   (WARNING: Writes a .h file with the same base name as the .dll file)\n\n");
-    printf("/QUIET (-q)\n * Just execute the build commands without printing them first.\n\n");
+    printf("/VERBOSE (-v)\n * Show the sub-commands being executed.\n\n");
     printf("/HELP (-h)\n * Show this help screen.\n\n");
     printf("/PRETTY\n * Generate pretty .c files from .au sources\n   (Ruins compiler and debugger messages, only meant as an escape hatch.) \n\n");
     printf("-I, -D, -L, -l\n * Passed through to the compiler or linker.\n\n");
@@ -984,8 +1047,8 @@ int main(int argc, char** argv) {
             dll_mode = true;
             last_flag = "";
             continue;
-        } else if (last_flag == "-q" || last_flag == "/quiet") {
-            quiet = true;
+        } else if (last_flag == "-v" || last_flag == "/verbose") {
+            quiet = false;
             last_flag = "";
             continue;
         } else if (last_flag == "/pretty") {
@@ -1009,7 +1072,7 @@ int main(int argc, char** argv) {
         if (ext == "au") {
             auto f = new SourceFile(argv[i]);
             if (!f->valid) {
-                fprintf(stderr, "[%s] Parse failed.\n", argv[i]);
+                fprintf(stderr, HILITE "%s: " ERROR_STYLE "error:" REGGS " parse failed\n", argv[i]);
                 return 1;
             }
             files.push_back(f);
@@ -1060,7 +1123,7 @@ int main(int argc, char** argv) {
         if (!system("gcc --help 2>/dev/null >/dev/null")) compiler = linker = "gcc";
         else if (!system("clang --help 2>/dev/null >/dev/null")) compiler = linker = "clang";
         else {
-            fprintf(stderr, "Failed to find a C compiler, please specify one with /CC:<c-compiler>\n");
+            fprintf(stderr, ERROR_STYLE "error:" REGGS " no C compiler found, please specify with /CC:your-c-compiler\n");
             return 1;
         }
     }
@@ -1075,7 +1138,6 @@ int main(int argc, char** argv) {
             // FIXME: detect use of unresolved templates, generate virtual implementation files for the templates, mark the templates resolved, continue loop
             if (!f->template_class.size()) {
                 if (!f->Compile()) {
-                    fprintf(stderr, "Compile error in %s\n", f->filename.c_str());
                     return 1;
                 }
                 f->processed = true;
@@ -1087,21 +1149,72 @@ int main(int argc, char** argv) {
     string bdir = build_dir + os + (debug_mode ? "-debug" : "-release");
     mkdir(bdir.c_str(), 0777);
     bdir += "/";
-    string include_list;
     string export_h;
     for(auto f: files) {
         if (f->template_class.size()) continue;
         string file_id = str_replace(str_replace(f->filename, ".", "_"), "/", "_");
-        export_h += f->public_head + f->post_head;
+        export_h += f->public_head + f->public_post_head;
         f->head = "#ifndef "+file_id+"\n" + "#define "+file_id+"\n" + prefix + f->head + f->post_head + "#endif\n";
         f->head = remove_empty_ifdefs(f->head);
         string out_hname = strip_filename(f->filename);
         string out_fn = bdir + out_hname + ".au.h";
-        include_list += "#include \""+out_hname+".au.h\"\n";
         if (!write_file(out_fn, f->head)) {
-            fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
+            fprintf(stderr, HILITE "%s: " ERROR_STYLE "error:" REGGS " failed to write file %s\n", f->filename.c_str(), out_fn.c_str());
             return 1;
         }
+    }
+    /*
+    for(auto f: files) {
+        printf("\nSymbol flags for %s:\n", f->filename.c_str());
+        for(auto sym: f->symbol_flags) {
+            if (!(sym.second&3)) continue;
+            printf("\t%s: %d\n", sym.first.c_str(), sym.second&3);
+        }
+    }
+    */
+    bool again, solved = false;
+    int moves = 0;
+    for(int wd=files.size()*files.size()*100;wd--;) {
+        again = false;
+        for(int i=0;i<files.size();i++) {
+            if (files[i]->template_class.size()) continue;
+            for(int j=i+1;j<files.size();j++) {
+                if (files[j]->template_class.size()) continue;
+                for(auto expo: files[j]->symbol_flags) {
+                    if (!(expo.second & 2)) continue;
+                    if ((files[i]->symbol_flags[expo.first] & 3) == 1) {
+                        files[j]->rearrangements++;
+                        SourceFile* tmp = files[i];
+                        files[i] = files[j];
+                        for(int k=j-i;k>=2;k--) {
+                            files[i+k] = files[i+k-1];
+                        }
+                        files[i+1] = tmp;
+                        again = true;
+                        moves++;
+                    }
+                }
+            }
+        }
+        if (!again) {
+            solved = true;
+            break;
+        }
+    }
+    if (!solved) {
+        fprintf(stderr, WARNING_STYLE "warning:" REGGS " failed to solve dependency ordering between files:\n");
+        for(auto f: files) {
+            if (f->template_class.size()) continue;
+            if (f->rearrangements < files.size()) continue;
+            fprintf(stderr, " * %s\n", f->filename.c_str());
+        }
+        fprintf(stderr, "\n");
+    }
+    string include_list;
+    for(auto f: files) {
+        if (f->template_class.size()) continue;
+        string out_hname = strip_filename(f->filename);
+        include_list += "#include \""+out_hname+".au.h\"\n";
     }
     if (debug_mode) {
         cflags += " "+debug_flags;
@@ -1127,21 +1240,42 @@ int main(int argc, char** argv) {
         ldflags += " -Wl,-rpath,'"+extract_dir(f)+"'";
         obj_list += " "+f;
     }
+    for(int i=0;i<files.size();i++) {
+        if (files[i]->template_class.size()) continue;
+        for(int j=0;j<files.size();j++) {
+            if (files[j]->template_class.size()) continue;
+            for(auto expo: files[j]->symbol_flags) {
+                if (!(expo.second & 2)) continue;
+                if ((files[i]->symbol_flags[expo.first] & 3) == 1) {
+                    files[i]->imports_from.push_back(files[j]);
+                }
+                if (files[i]->symbol_flags[expo.first] & 5) {
+                    files[j]->exports_to.push_back(files[i]);
+                }
+            }
+        }
+    }
+    for(auto f: files) {
+        string out_ob = bdir + strip_filename(f->filename) + ".au.o";
+        if (should_rebuild(out_ob, file_mtime(f->filename))) {
+            set_rebuild_recursive(f);
+        }
+    }
     for(auto f: files) {
         if (f->template_class.size()) continue;
         string file_id = str_replace(str_replace(f->filename, ".", "_"), "/", "_");
-        f->body = prefix + "#define "+file_id+"\n" + include_list + f->local_head + f->local_post_head + f->body;
+        f->body = prefix + include_list + f->local_head + f->local_post_head + f->body;
         string out_base = bdir + strip_filename(f->filename);
         string out_fn = out_base + ".au.c";
         if (!write_file(out_fn, f->body)) {
-            fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
+            fprintf(stderr, HILITE "%s: " ERROR_STYLE "error:" REGGS " failed to write file %s\n", f->filename.c_str(), out_fn.c_str());
             return 1;
         }
         string out_ob = out_base + ".au.o";
         string srcdir = extract_dir(f->filename);
         string cmd = compiler + " -c -o '"+out_ob+"' '"+out_fn+"' -I'" + srcdir + "' " + cflags;
         obj_list += " '"+out_ob+"'";
-        if (should_rebuild(out_ob, file_mtime(f->filename))) {
+        if (f->rebuild) {
             if (!quiet) printf("%s\n", cmd.c_str());
             int r = system(cmd.c_str());
             if (r) return r;
@@ -1161,6 +1295,9 @@ int main(int argc, char** argv) {
         }
     }
     if (resource_compiler.size()) {
+        if (!version.size()) {
+            version = "0,0,0,0";
+        }
         if (!rc_files.size()) {
             string rc = winrc;
             rc = str_replace(rc, "$ICON", icon.size() ? ("APPICON ICON "+icon) : "");
@@ -1174,7 +1311,10 @@ int main(int argc, char** argv) {
             string out_fn = bdir + "default.rc";
             if (read_file(out_fn) != rc) {
                 if (!write_file(out_fn, rc)) {
-                    fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
+                    string errfn = "default.rc";
+                    if (icon.size()) errfn = icon;
+                    if (manifest.size()) errfn = manifest;
+                    fprintf(stderr, HILITE "%s: " ERROR_STYLE "error:" REGGS " failed to write file %s\n", errfn.c_str(), out_fn.c_str());
                     return 1;
                 }
             }
@@ -1206,7 +1346,7 @@ int main(int argc, char** argv) {
         export_h = "#ifndef "+file_token+"\n" + "#define "+file_token+"\n" + export_h + "#endif\n";
         export_h = remove_empty_ifdefs(export_h);
         if (!write_file(out_fn, export_h)) {
-            fprintf(stderr, "Failed to write %s\n", out_fn.c_str());
+            fprintf(stderr, HILITE "%s: " ERROR_STYLE "error:" REGGS " failed to write file %s\n", output.c_str(), out_fn.c_str());
             return 1;
         }
     }
